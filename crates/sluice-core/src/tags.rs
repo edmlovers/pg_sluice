@@ -60,6 +60,11 @@ pub fn parse_tags(sql: &str) -> Tags {
 }
 
 /// Returns the body of the `/* ... */` comment that ends the statement, if any.
+///
+/// Plain string search rather than a regex: a regex matches left to right, so
+/// it would start from the first `/*` in the statement (which may sit inside a
+/// string literal) and read the whole statement. Searching backwards from the
+/// end lands on the right `/*` and only looks at the tail.
 fn trailing_comment(sql: &str) -> Option<&str> {
     let sql = sql.trim_end_matches(|c: char| c.is_ascii_whitespace() || c == ';');
     let sql = sql.strip_suffix("*/")?;
