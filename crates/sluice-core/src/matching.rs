@@ -5,20 +5,13 @@
 //! so looking up the query's own tags finds every candidate, and the remaining
 //! conditions are then checked one by one.
 
-use std::hash::{Hash, Hasher};
-
-use hashbrown::{Equivalent, HashMap};
-use smallvec::SmallVec;
+use std::collections::HashMap;
 
 use crate::rules::Rules;
 use crate::tags::Tags;
 
 /// Position of a budget in [`Rules::budgets`], i.e. its declaration order.
 pub type BudgetIdx = u16;
-
-/// Budgets a query matched, in declaration order. Stays on the stack for up to
-/// 8 budgets.
-pub type Matched = SmallVec<[BudgetIdx; 8]>;
 
 #[derive(Debug, Clone, Default)]
 pub struct RuleIndex {
@@ -61,13 +54,10 @@ impl RuleIndex {
     }
 
     /// Budgets whose rules `tags` satisfy, each once, in declaration order.
-    pub fn matching_budgets(&self, tags: &Tags) -> Matched {
-        let mut out = Matched::new();
-        if self.rules.is_empty() {
-            return out;
-        }
+    pub fn matching_budgets(&self, tags: &Tags) -> Vec<BudgetIdx> {
+        let mut out = Vec::new();
         for (key, value) in tags.iter() {
-            let Some(candidates) = self.by_tag.get(&TagRef(key, value)) else {
+            let Some(candidates) = self.by_tag.get(&(key.to_owned(), value.to_owned())) else {
                 continue;
             };
             for &r in candidates {
@@ -84,23 +74,6 @@ impl RuleIndex {
         }
         out.sort_unstable();
         out
-    }
-}
-
-/// Borrowed lookup key for `by_tag`, so a lookup doesn't build two `String`s.
-/// Hashes exactly like `(String, String)`.
-struct TagRef<'a>(&'a str, &'a str);
-
-impl Hash for TagRef<'_> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-        self.1.hash(state);
-    }
-}
-
-impl Equivalent<(String, String)> for TagRef<'_> {
-    fn equivalent(&self, key: &(String, String)) -> bool {
-        self.0 == key.0 && self.1 == key.1
     }
 }
 
@@ -130,7 +103,7 @@ mod tests {
     }
 
     fn matched(index: &RuleIndex, pairs: &[(&str, &str)]) -> Vec<BudgetIdx> {
-        index.matching_budgets(&tags(pairs)).to_vec()
+        index.matching_budgets(&tags(pairs))
     }
 
     #[test]
@@ -224,16 +197,6 @@ mod tests {
     fn works_on_parsed_tags() {
         let idx = index(&[("csv", r#"[{"feature":"export_csv","route":"/reports"}]"#)]);
         let tags = crate::parse_tags("SELECT 1 /*feature='export_csv',route='%2Freports'*/");
-        assert_eq!(idx.matching_budgets(&tags).to_vec(), [0]);
-    }
-
-    #[test]
-    fn tag_ref_hashes_like_owned_key() {
-        use std::hash::BuildHasher;
-        let s = hashbrown::DefaultHashBuilder::default();
-        assert_eq!(
-            s.hash_one(TagRef("app", "x")),
-            s.hash_one(("app".to_string(), "x".to_string()))
-        );
+        assert_eq!(idx.matching_budgets(&tags), [0]);
     }
 }
