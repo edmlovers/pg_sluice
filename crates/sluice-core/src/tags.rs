@@ -10,6 +10,7 @@
 
 use std::sync::LazyLock;
 
+use memchr::memmem;
 use regex::Regex;
 
 /// Only the last `MAX_SCAN` bytes of the statement are searched for the comment.
@@ -64,18 +65,16 @@ pub fn parse_tags(sql: &str) -> Tags {
 /// Plain string search rather than a regex: a regex matches left to right, so
 /// it would start from the first `/*` in the statement (which may sit inside a
 /// string literal) and read the whole statement. Searching backwards from the
-/// end lands on the right `/*` and only looks at the tail.
+/// end lands on the right `/*` and only looks at the tail. `memmem` does that
+/// search with SIMD, many bytes per instruction.
 fn trailing_comment(sql: &str) -> Option<&str> {
     let sql = sql.trim_end_matches(|c: char| c.is_ascii_whitespace() || c == ';');
     let sql = sql.strip_suffix("*/")?;
     let window = sql.len().saturating_sub(MAX_SCAN);
-    let open = sql.as_bytes()[window..]
-        .windows(2)
-        .rposition(|w| w == b"/*")?
-        + window;
+    let open = window + memmem::rfind(&sql.as_bytes()[window..], b"/*")?;
     let body = &sql[open + 2..];
     // `/* a */ b */`: the statement does not end in a single comment.
-    if body.contains("*/") {
+    if memmem::find(body.as_bytes(), b"*/").is_some() {
         return None;
     }
     Some(body)
