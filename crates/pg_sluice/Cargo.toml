@@ -1,0 +1,9 @@
+[package]
+name = "pg_sluice"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+# Becomes a pgrx crate (crate-type = ["cdylib", "lib"]) in T2.1.
+[dependencies]
+sluice-core.workspace = true
