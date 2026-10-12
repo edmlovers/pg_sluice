@@ -5,3 +5,4 @@ edition.workspace = true
 repository.workspace = true
 
 [dependencies]
+regex = "1.13.1"

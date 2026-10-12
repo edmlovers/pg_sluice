@@ -8,6 +8,10 @@
 //! Format: `/*key='value',key2='value2'*/`, keys and values URL-encoded, `'` inside
 //! a value escaped as `\'`.
 
+use std::sync::LazyLock;
+
+use regex::Regex;
+
 /// Only the last `MAX_SCAN` bytes of the statement are searched for the comment.
 pub const MAX_SCAN: usize = 1024;
 
@@ -72,42 +76,26 @@ fn trailing_comment(sql: &str) -> Option<&str> {
     Some(body)
 }
 
+/// One `key='value'` pair. The value may contain `\'` (or any `\x` escape).
+const PAIR: &str = r"([^\s=',]+)\s*=\s*'((?:[^'\\]|\\.)*)'";
+
+static PAIR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(PAIR).unwrap());
+
+/// A whole comment body: nothing, or pairs separated by commas.
+static BODY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"(?s)^\s*(?:{PAIR}\s*(?:,\s*{PAIR}\s*)*)?$")).unwrap());
+
 fn parse_body(body: &str) -> Option<Tags> {
+    if !BODY_RE.is_match(body) {
+        return None;
+    }
+    // The body is known to be well-formed, so the pairs are exactly the
+    // non-overlapping matches of PAIR, left to right.
     let mut tags = Tags::new();
-    let mut rest = body.trim_ascii();
-    if rest.is_empty() {
-        return Some(tags);
+    for caps in PAIR_RE.captures_iter(body) {
+        tags.insert(&decode(&caps[1])?, &decode(&caps[2])?);
     }
-    loop {
-        let eq = rest.find('=')?;
-        let raw_key = rest[..eq].trim_ascii();
-        if raw_key.is_empty() || raw_key.contains(['\'', ',']) {
-            return None;
-        }
-        let (raw_value, after) = split_quoted(rest[eq + 1..].trim_ascii_start())?;
-        tags.insert(&decode(raw_key)?, &decode(raw_value)?);
-
-        rest = after.trim_ascii_start();
-        if rest.is_empty() {
-            return Some(tags);
-        }
-        rest = rest.strip_prefix(',')?.trim_ascii_start();
-    }
-}
-
-/// Splits `'value' rest` into the raw value (escapes untouched) and the rest.
-fn split_quoted(s: &str) -> Option<(&str, &str)> {
-    let s = s.strip_prefix('\'')?;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'\'' => return Some((&s[..i], &s[i + 1..])),
-            _ => i += 1,
-        }
-    }
-    None
+    Some(tags)
 }
 
 /// Undoes `\x` escapes and `%XX` URL-encoding.
@@ -199,6 +187,14 @@ mod tests {
         assert_eq!(
             tags(r"SELECT 1 /*note='it\'s'*/"),
             pairs(&[("note", "it's")])
+        );
+    }
+
+    #[test]
+    fn escaped_quote_and_comma_stay_inside_the_value() {
+        assert_eq!(
+            tags(r"SELECT 1 /*note='a\',b=\'c',app='x'*/"),
+            pairs(&[("note", "a',b='c"), ("app", "x")])
         );
     }
 
