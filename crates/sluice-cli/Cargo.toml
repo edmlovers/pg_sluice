@@ -1,0 +1,12 @@
+[package]
+name = "sluice-cli"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sluice"
+path = "src/main.rs"
+
+[dependencies]
+sluice-core.workspace = true
