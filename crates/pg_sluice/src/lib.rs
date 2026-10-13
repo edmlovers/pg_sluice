@@ -45,8 +45,7 @@ pub extern "C-unwind" fn _PG_init() {
 #[pg_guard]
 unsafe extern "C-unwind" fn executor_start(query_desc: *mut pg_sys::QueryDesc, eflags: i32) {
     let source_text = unsafe { (*query_desc).sourceText };
-    // Nested queries are covered by the client query that started them.
-    if NESTING_LEVEL.load(Ordering::Relaxed) == 0 && !source_text.is_null() {
+    if should_check(eflags) && !source_text.is_null() {
         HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
         let sql = unsafe { CStr::from_ptr(source_text) }.to_string_lossy();
         let tags = sluice_core::parse_tags(&sql);
@@ -76,6 +75,28 @@ unsafe extern "C-unwind" fn executor_start(query_desc: *mut pg_sys::QueryDesc, e
             None => pg_sys::standard_ExecutorStart(query_desc, eflags),
         }
     }
+}
+
+/// Whether sluice should look at the query that is starting.
+fn should_check(eflags: i32) -> bool {
+    // Queries run by a function or trigger belong to the query that started them.
+    if NESTING_LEVEL.load(Ordering::Relaxed) > 0 {
+        return false;
+    }
+    // Plain EXPLAIN only plans the query. EXPLAIN ANALYZE runs it, so it is checked.
+    if eflags as u32 & pg_sys::EXEC_FLAG_EXPLAIN_ONLY != 0 {
+        return false;
+    }
+    // Autovacuum, parallel workers and other background processes.
+    if unsafe { pg_sys::MyBackendType } != pg_sys::BackendType::B_BACKEND {
+        return false;
+    }
+    // Superusers must always get in, e.g. to fix a bad rule.
+    // TODO(M3): make this the sluice.exempt_superuser setting.
+    if unsafe { pg_sys::superuser() } {
+        return false;
+    }
+    true
 }
 
 /// Runs the query. Any query started meanwhile (e.g. by a function the query
@@ -161,9 +182,12 @@ mod tests {
 /// app's, and errors come back with their SQLSTATE.
 #[cfg(test)]
 mod client_tests {
+    use std::sync::Once;
+
     use postgres::error::SqlState;
 
-    /// Starts the test server if it isn't running yet, and connects to it.
+    /// Starts the test server if it isn't running yet, and connects to it as
+    /// the user that created it, a superuser.
     fn connect() -> postgres::Client {
         // pgrx only starts the server from run_test, which runs a #[pg_test].
         pgrx_tests::run_test(
@@ -172,12 +196,52 @@ mod client_tests {
             crate::pg_test::postgresql_conf_options(),
         )
         .unwrap();
-        pgrx_tests::client().unwrap().0
+        let mut client = pgrx_tests::client().unwrap().0;
+        static SETUP: Once = Once::new();
+        SETUP.call_once(|| setup(&mut client));
+        client
+    }
+
+    /// Connects as an ordinary role, like an app. Superusers aren't checked.
+    fn connect_as_app() -> postgres::Client {
+        let mut client = connect();
+        client.batch_execute("SET ROLE sluice_app").unwrap();
+        client
+    }
+
+    /// What the tests need, created once per test run.
+    fn setup(client: &mut postgres::Client) {
+        client
+            .batch_execute(
+                "CREATE ROLE sluice_app;
+                 GRANT USAGE ON SCHEMA tests TO sluice_app;
+
+                 CREATE FUNCTION sluice_three_queries() RETURNS void
+                 LANGUAGE plpgsql AS $$
+                 BEGIN
+                     -- Not `PERFORM 1`: PL/pgSQL works that out without the executor.
+                     PERFORM count(*) FROM pg_class;
+                     PERFORM count(*) FROM pg_class;
+                     PERFORM count(*) FROM pg_class;
+                 END $$;
+
+                 CREATE FUNCTION sluice_fails() RETURNS void
+                 LANGUAGE plpgsql AS $$
+                 BEGIN
+                     PERFORM count(*) / 0 FROM pg_class;
+                 END $$;",
+            )
+            .unwrap();
+    }
+
+    fn assert_rejected(client: &mut postgres::Client, sql: &str) {
+        let err = client.simple_query(sql).unwrap_err();
+        assert_eq!(*err.code().unwrap(), SqlState::INSUFFICIENT_RESOURCES);
     }
 
     #[test]
     fn blocked_app_is_rejected() {
-        let mut client = connect();
+        let mut client = connect_as_app();
         let err = client
             .simple_query("SELECT 1 /* app='blocked' */")
             .unwrap_err();
@@ -185,6 +249,32 @@ mod client_tests {
         assert_eq!(*err.code(), SqlState::INSUFFICIENT_RESOURCES); // 53000
         assert_eq!(err.message(), "sluice: query rejected");
         assert_eq!(err.detail(), Some("reason=blocked app=blocked"));
+    }
+
+    #[test]
+    fn other_apps_run() {
+        let mut client = connect_as_app();
+        client
+            .simple_query("SELECT 1 /* app='dashboard' */")
+            .unwrap();
+        client.simple_query("SELECT 1").unwrap();
+    }
+
+    /// Superusers must always get in, e.g. to fix a bad rule.
+    #[test]
+    fn superuser_is_not_checked() {
+        let mut client = connect();
+        client.simple_query("SELECT 1 /* app='blocked' */").unwrap();
+    }
+
+    /// Plain EXPLAIN only plans the query. EXPLAIN ANALYZE runs it.
+    #[test]
+    fn explain_is_not_checked_but_explain_analyze_is() {
+        let mut client = connect_as_app();
+        client
+            .simple_query("EXPLAIN SELECT 1 /* app='blocked' */")
+            .unwrap();
+        assert_rejected(&mut client, "EXPLAIN ANALYZE SELECT 1 /* app='blocked' */");
     }
 
     /// Calls `f` and returns how many queries the hook handled meanwhile.
@@ -206,7 +296,7 @@ mod client_tests {
 
     #[test]
     fn hook_runs_for_each_query() {
-        let mut client = connect();
+        let mut client = connect_as_app();
         let calls = hook_calls_during(&mut client, |c| {
             c.simple_query("SELECT 1").unwrap();
             c.simple_query("SELECT 2").unwrap();
@@ -217,18 +307,7 @@ mod client_tests {
     /// A function's queries belong to the query that called it: count it once.
     #[test]
     fn nested_queries_are_handled_once() {
-        let mut client = connect();
-        client
-            .batch_execute(
-                "CREATE OR REPLACE FUNCTION sluice_three_queries() RETURNS void
-                 LANGUAGE plpgsql AS $$
-                 BEGIN
-                     PERFORM count(*) FROM pg_class;
-                     PERFORM count(*) FROM pg_class;
-                     PERFORM count(*) FROM pg_class;
-                 END $$",
-            )
-            .unwrap();
+        let mut client = connect_as_app();
         let calls = hook_calls_during(&mut client, |c| {
             c.simple_query("SELECT sluice_three_queries()").unwrap();
         });
@@ -239,32 +318,10 @@ mod client_tests {
     /// or every later query in the session would look nested and be skipped.
     #[test]
     fn failed_nested_query_does_not_leave_session_nested() {
-        let mut client = connect();
-        client
-            .batch_execute(
-                "CREATE OR REPLACE FUNCTION sluice_fails() RETURNS void
-                 LANGUAGE plpgsql AS $$
-                 BEGIN
-                     PERFORM count(*) / 0 FROM pg_class;
-                 END $$",
-            )
-            .unwrap();
+        let mut client = connect_as_app();
         let err = client.simple_query("SELECT sluice_fails()").unwrap_err();
         assert_eq!(*err.code().unwrap(), SqlState::DIVISION_BY_ZERO);
-
-        let err = client
-            .simple_query("SELECT 1 /* app='blocked' */")
-            .unwrap_err();
-        assert_eq!(*err.code().unwrap(), SqlState::INSUFFICIENT_RESOURCES);
-    }
-
-    #[test]
-    fn other_apps_run() {
-        let mut client = connect();
-        client
-            .simple_query("SELECT 1 /* app='dashboard' */")
-            .unwrap();
-        client.simple_query("SELECT 1").unwrap();
+        assert_rejected(&mut client, "SELECT 1 /* app='blocked' */");
     }
 }
 
