@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6a8b7519ce4b55d8e49c1f305dd250c82b16eedae7e8015b3660e7ad69730358 # shrinks to cpu_share = 0.01, burst_s = 0.1, cores = 1, ops = [Settle { est: 0.0, actual: 9.748312469690247e94 }, Admit { est: 0.0, dt_us: 0 }]
