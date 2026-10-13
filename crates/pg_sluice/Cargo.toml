@@ -4,6 +4,18 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 
-# Becomes a pgrx crate (crate-type = ["cdylib", "lib"]) in T2.1.
+[lib]
+# Postgres loads the extension as a shared library (.so).
+crate-type = ["cdylib"]
+
+[features]
+default = ["pg18"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
+pg_test = []
+
 [dependencies]
+pgrx = "=0.19.3"
 sluice-core.workspace = true
+
+[dev-dependencies]
+pgrx-tests = "=0.19.3"
