@@ -1,0 +1,32 @@
+[package]
+name = "sluice-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace: needs nightly (`cargo +nightly fuzz`), so the stable CI
+# building the main workspace must not pick it up.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.sluice-core]
+path = ".."
+
+[[bin]]
+name = "parse_tags"
+path = "fuzz_targets/parse_tags.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "validate"
+path = "fuzz_targets/validate.rs"
+test = false
+doc = false
+bench = false
