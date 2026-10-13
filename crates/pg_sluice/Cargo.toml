@@ -19,3 +19,4 @@ sluice-core.workspace = true
 
 [dev-dependencies]
 pgrx-tests = "=0.19.3"
+postgres = "0.19"

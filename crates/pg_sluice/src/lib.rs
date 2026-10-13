@@ -37,7 +37,18 @@ unsafe extern "C-unwind" fn executor_start(query_desc: *mut pg_sys::QueryDesc, e
     let source_text = unsafe { (*query_desc).sourceText };
     if !source_text.is_null() {
         let sql = unsafe { CStr::from_ptr(source_text) }.to_string_lossy();
-        notice!("sluice: {sql}");
+        let tags = sluice_core::parse_tags(&sql);
+        // A hard-coded rule until budgets arrive.
+        if tags.get("app") == Some("blocked") {
+            // Raises a Postgres ERROR: the query never starts, and the client
+            // gets SQLSTATE 53000 with this message and detail.
+            ereport!(
+                ERROR,
+                PgSqlErrorCode::ERRCODE_INSUFFICIENT_RESOURCES,
+                "sluice: query rejected",
+                "reason=blocked app=blocked",
+            );
+        }
     }
 
     // Pass the query on down the chain. Only the last hook calls the standard
@@ -58,6 +69,10 @@ mod tests {
     use pgrx::prelude::*;
 
     use crate::HOOK_CALLS;
+
+    /// Does nothing: `client_tests` run it to get the test server started.
+    #[pg_test]
+    fn start_server() {}
 
     #[pg_test]
     fn hook_runs_for_each_query() {
@@ -85,6 +100,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(calls, Some(3));
+    }
+}
+
+/// Tests that connect as a normal client. Their queries are top-level, like an
+/// app's, and errors come back with their SQLSTATE.
+#[cfg(test)]
+mod client_tests {
+    use postgres::error::SqlState;
+
+    /// Starts the test server if it isn't running yet, and connects to it.
+    fn connect() -> postgres::Client {
+        // pgrx only starts the server from run_test, which runs a #[pg_test].
+        pgrx_tests::run_test(
+            "start_server",
+            None,
+            crate::pg_test::postgresql_conf_options(),
+        )
+        .unwrap();
+        pgrx_tests::client().unwrap().0
+    }
+
+    #[test]
+    fn blocked_app_is_rejected() {
+        let mut client = connect();
+        let err = client
+            .simple_query("SELECT 1 /* app='blocked' */")
+            .unwrap_err();
+        let err = err.as_db_error().unwrap();
+        assert_eq!(*err.code(), SqlState::INSUFFICIENT_RESOURCES); // 53000
+        assert_eq!(err.message(), "sluice: query rejected");
+        assert_eq!(err.detail(), Some("reason=blocked app=blocked"));
+    }
+
+    #[test]
+    fn other_apps_run() {
+        let mut client = connect();
+        client
+            .simple_query("SELECT 1 /* app='dashboard' */")
+            .unwrap();
+        client.simple_query("SELECT 1").unwrap();
     }
 }
 
