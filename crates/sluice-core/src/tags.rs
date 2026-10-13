@@ -10,15 +10,24 @@
 
 use std::sync::LazyLock;
 
+use arrayvec::{ArrayString, ArrayVec};
 use memchr::memmem;
 use regex::Regex;
 
 /// Only the last `MAX_SCAN` bytes of the statement are searched for the comment.
 pub const MAX_SCAN: usize = 1024;
+/// Tags beyond the first `MAX_TAGS` are dropped.
+pub const MAX_TAGS: usize = 16;
+/// Longer keys are cut to this many bytes (on a char boundary).
+pub const MAX_KEY_LEN: usize = 32;
+/// Longer values are cut to this many bytes (on a char boundary).
+pub const MAX_VALUE_LEN: usize = 64;
 
+/// Up to [`MAX_TAGS`] key/value pairs, stored inline so building one never
+/// touches the heap.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tags {
-    pairs: Vec<(String, String)>,
+    pairs: ArrayVec<(ArrayString<MAX_KEY_LEN>, ArrayString<MAX_VALUE_LEN>), MAX_TAGS>,
 }
 
 impl Tags {
@@ -26,17 +35,25 @@ impl Tags {
         Self::default()
     }
 
-    /// Adds a tag. If the key is already present the existing value is kept.
+    /// Adds a tag, cutting key and value to their maximum length. If the key is
+    /// already present the existing value is kept; if the set is full the tag is
+    /// dropped.
     pub fn insert(&mut self, key: &str, value: &str) {
-        if self.get(key).is_none() {
-            self.pairs.push((key.to_owned(), value.to_owned()));
+        let key = truncate(key, MAX_KEY_LEN);
+        if self.pairs.is_full() || self.get(key).is_some() {
+            return;
         }
+        let mut k = ArrayString::new();
+        k.push_str(key);
+        let mut v = ArrayString::new();
+        v.push_str(truncate(value, MAX_VALUE_LEN));
+        self.pairs.push((k, v));
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
         self.pairs
             .iter()
-            .find(|(k, _)| k == key)
+            .find(|(k, _)| k.as_str() == key)
             .map(|(_, v)| v.as_str())
     }
 
@@ -51,6 +68,10 @@ impl Tags {
     pub fn is_empty(&self) -> bool {
         self.pairs.is_empty()
     }
+}
+
+fn truncate(s: &str, max: usize) -> &str {
+    &s[..s.floor_char_boundary(max)]
 }
 
 /// Reads the tags from the trailing sqlcommenter comment of `sql`.
@@ -280,5 +301,47 @@ mod tests {
         // The window start lands inside multi-byte characters; must not panic.
         let sql = format!("SELECT '{}' /*app='x'*/", "é".repeat(MAX_SCAN));
         assert_eq!(tags(&sql), pairs(&[("app", "x")]));
+    }
+
+    #[test]
+    fn keeps_only_the_first_max_tags() {
+        let body: Vec<String> = (0..MAX_TAGS + 4).map(|i| format!("k{i}='v'")).collect();
+        let parsed = parse_tags(&format!("SELECT 1 /*{}*/", body.join(",")));
+        assert_eq!(parsed.len(), MAX_TAGS);
+        assert_eq!(parsed.get("k15"), Some("v"));
+        assert_eq!(parsed.get("k16"), None);
+    }
+
+    #[test]
+    fn cuts_long_keys_and_values() {
+        let key = "k".repeat(MAX_KEY_LEN + 10);
+        let value = "v".repeat(MAX_VALUE_LEN + 10);
+        let parsed = parse_tags(&format!("SELECT 1 /*{key}='{value}'*/"));
+        assert_eq!(
+            parsed.get(&key[..MAX_KEY_LEN]),
+            Some(&value[..MAX_VALUE_LEN])
+        );
+    }
+
+    #[test]
+    fn cut_does_not_split_a_char() {
+        // 63 ASCII bytes, then a 2-byte char that would end at byte 65.
+        let prefix = "a".repeat(MAX_VALUE_LEN - 1);
+        let parsed = parse_tags(&format!("SELECT 1 /*k='{prefix}%C3%A9'*/"));
+        assert_eq!(parsed.get("k"), Some(prefix.as_str()));
+    }
+
+    #[test]
+    fn bad_escape_after_the_cut_is_still_malformed() {
+        let value = "v".repeat(MAX_VALUE_LEN);
+        assert!(parse_tags(&format!("SELECT 1 /*k='{value}%zz'*/")).is_empty());
+    }
+
+    #[test]
+    fn insert_cuts_on_char_boundary() {
+        let mut tags = Tags::new();
+        let value = "é".repeat(MAX_VALUE_LEN);
+        tags.insert("k", &value);
+        assert_eq!(tags.get("k"), Some(&value[..MAX_VALUE_LEN]));
     }
 }
