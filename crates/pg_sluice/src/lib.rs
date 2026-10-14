@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
-use sluice_core::Rules;
+use sluice_core::{RuleIndex, Rules};
 
 pgrx::pg_module_magic!(name, version);
 
@@ -25,6 +25,8 @@ struct LoadedRules {
     text: String,
     /// Parsed from the last valid text. No budgets until there is one.
     rules: Rules,
+    /// Which budgets a query's tags fall under, built from `rules`.
+    index: RuleIndex,
 }
 
 thread_local! {
@@ -140,7 +142,10 @@ fn refresh_rules() {
             return;
         }
         match sluice_core::validate(&text, sluice_core::rules::DEFAULT_MAX_BUDGETS) {
-            Ok(rules) => loaded.rules = rules,
+            Ok(rules) => {
+                loaded.index = RuleIndex::new(&rules);
+                loaded.rules = rules;
+            }
             Err(errors) => {
                 let errors: Vec<String> = errors.iter().map(ToString::to_string).collect();
                 warning!(
@@ -151,6 +156,58 @@ fn refresh_rules() {
         }
         loaded.text = text;
     });
+}
+
+/// SQL functions any user can call, to check rules and queries by hand.
+#[pg_schema]
+mod sluice {
+    use pgrx::JsonB;
+    use pgrx::prelude::*;
+    use serde_json::{Value, json};
+
+    use crate::{LOADED_RULES, refresh_rules};
+
+    // A new schema is only usable by its owner.
+    pgrx::extension_sql!(
+        "GRANT USAGE ON SCHEMA sluice TO PUBLIC;",
+        name = "grant_sluice_schema",
+        finalize,
+    );
+
+    /// Checks a rule set without applying it. Returns its errors, e.g.
+    /// `[{"path": "budgets[0].mode", "message": "..."}]`, or `[]` if it is valid.
+    #[pg_extern]
+    fn validate(rules: &str) -> JsonB {
+        let errors = match sluice_core::validate(rules, sluice_core::rules::DEFAULT_MAX_BUDGETS) {
+            Ok(_) => Vec::new(),
+            Err(errors) => errors
+                .iter()
+                .map(|e| json!({ "path": e.path, "message": e.message }))
+                .collect(),
+        };
+        JsonB(Value::Array(errors))
+    }
+
+    /// What sluice sees in a query, without running it: its tags and the
+    /// budgets they match, e.g. `{"tags": {"app": "x"}, "budgets": ["reports"]}`.
+    #[pg_extern]
+    fn explain(sql: &str) -> JsonB {
+        refresh_rules();
+        let tags = sluice_core::parse_tags(sql);
+        let budgets: Vec<String> = LOADED_RULES.with_borrow(|loaded| {
+            loaded
+                .index
+                .matching_budgets(&tags)
+                .into_iter()
+                .map(|i| loaded.rules.budgets[usize::from(i)].name.clone())
+                .collect()
+        });
+        let tags: serde_json::Map<String, Value> = tags
+            .iter()
+            .map(|(key, value)| (key.to_owned(), Value::from(value)))
+            .collect();
+        JsonB(json!({ "tags": tags, "budgets": budgets }))
+    }
 }
 
 /// Whether sluice should look at the query that is starting.
@@ -443,6 +500,57 @@ mod client_tests {
         let _invalid = SystemSetting::set("sluice.rules", "{not json");
         wait_for_setting(&mut client, "sluice.rules", "{not json");
         assert_eq!(loaded_budgets(&mut client), ["reports"]);
+    }
+
+    /// Any user can check a rule set before applying it.
+    #[test]
+    fn validate_lists_errors() {
+        let _settings = default_settings();
+        let mut client = connect_as_app();
+        let error_count: i32 = client
+            .query_one(
+                "SELECT jsonb_array_length(sluice.validate($1))",
+                &[&REPORTS_RULES],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(error_count, 0);
+
+        let bad = r#"{"budgets":[{"name":"x","mode":"bogus","match":[{"app":"a"}]}]}"#;
+        let path: String = client
+            .query_one("SELECT sluice.validate($1) -> 0 ->> 'path'", &[&bad])
+            .unwrap()
+            .get(0);
+        assert_eq!(path, "budgets[0].mode");
+    }
+
+    /// `sluice.explain` shows the tags sluice reads and the budgets they match.
+    #[test]
+    fn explain_shows_tags_and_budgets() {
+        let _settings = SERVER_SETTINGS.write().unwrap_or_else(|e| e.into_inner());
+        let mut client = connect_as_app();
+        let _rules = SystemSetting::set("sluice.rules", REPORTS_RULES);
+        wait_for_setting(&mut client, "sluice.rules", REPORTS_RULES);
+
+        let mut assert_explains = |sql: &str, expected: &str| {
+            // Both sides go through jsonb, so spacing and key order don't matter.
+            let row = client
+                .query_one(
+                    "SELECT sluice.explain($1)::text, $2::text::jsonb::text",
+                    &[&sql, &expected],
+                )
+                .unwrap();
+            assert_eq!(row.get::<_, String>(0), row.get::<_, String>(1));
+        };
+        assert_explains(
+            "SELECT 1 /* app='dashboard',user='an' */",
+            r#"{"tags": {"app": "dashboard", "user": "an"}, "budgets": ["reports"]}"#,
+        );
+        assert_explains(
+            "SELECT 1 /* app='api' */",
+            r#"{"tags": {"app": "api"}, "budgets": []}"#,
+        );
+        assert_explains("SELECT 1", r#"{"tags": {}, "budgets": []}"#);
     }
 
     /// A server-wide setting changed with ALTER SYSTEM. Dropping it resets the
