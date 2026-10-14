@@ -21,3 +21,10 @@ sluice-core.workspace = true
 [dev-dependencies]
 pgrx-tests = "=0.19.3"
 postgres = "0.19"
+
+[lints.rust]
+# pgrx macros (e.g. pg_shmem_init!) check every Postgres version's feature,
+# but this crate only builds for pg18.
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("pg13", "pg14", "pg15", "pg16", "pg17", "pg19"))',
+] }

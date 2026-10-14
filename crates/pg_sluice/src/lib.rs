@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use pgrx::pg_sys;
 use pgrx::prelude::*;
-use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
+use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting, PgAtomic, pg_shmem_init};
 use sluice_core::{RuleIndex, Rules};
 
 pgrx::pg_module_magic!(name, version);
@@ -36,7 +36,14 @@ thread_local! {
 
 /// How many client queries the ExecutorStart hook has handled in this backend
 /// (nested queries are skipped). Only read by tests.
+///
+/// Every backend is a process of its own, with its own copy of each `static`:
+/// this counts this backend's queries only.
 static HOOK_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// The same count for all backends together. It lives in shared memory, which
+/// the postmaster sets up at startup and every backend then maps.
+static QUERIES_CHECKED: PgAtomic<AtomicU64> = unsafe { PgAtomic::new(c"sluice_queries_checked") };
 
 /// How many queries are running in this backend right now, counting the ones
 /// started by other queries (a function's queries run inside the query that
@@ -80,6 +87,10 @@ pub extern "C-unwind" fn _PG_init() {
     // instead of being silently ignored.
     unsafe { pg_sys::MarkGUCPrefixReserved(c"sluice".as_ptr()) };
 
+    // Asks the postmaster for room in shared memory. That is only possible
+    // while it starts, so another reason to be in shared_preload_libraries.
+    pg_shmem_init!(QUERIES_CHECKED);
+
     unsafe {
         PREV_EXECUTOR_START = pg_sys::ExecutorStart_hook;
         pg_sys::ExecutorStart_hook = Some(executor_start);
@@ -96,6 +107,7 @@ unsafe extern "C-unwind" fn executor_start(query_desc: *mut pg_sys::QueryDesc, e
     let source_text = unsafe { (*query_desc).sourceText };
     if should_check(eflags) && !source_text.is_null() {
         HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
+        QUERIES_CHECKED.get().fetch_add(1, Ordering::Relaxed);
         refresh_rules();
         let sql = unsafe { CStr::from_ptr(source_text) }.to_string_lossy();
         let tags = sluice_core::parse_tags(&sql);
@@ -281,7 +293,7 @@ mod tests {
 
     use pgrx::prelude::*;
 
-    use crate::{HOOK_CALLS, LOADED_RULES};
+    use crate::{HOOK_CALLS, LOADED_RULES, QUERIES_CHECKED};
 
     /// Does nothing: `client_tests` run it to get the test server started.
     #[pg_test]
@@ -291,6 +303,12 @@ mod tests {
     #[pg_extern]
     fn hook_calls() -> i64 {
         HOOK_CALLS.load(Ordering::Relaxed) as i64
+    }
+
+    /// Lets `client_tests` read the count shared by all backends.
+    #[pg_extern]
+    fn queries_checked() -> i64 {
+        QUERIES_CHECKED.get().load(Ordering::Relaxed) as i64
     }
 
     /// Lets `client_tests` see the budgets this backend has loaded.
@@ -616,6 +634,29 @@ mod client_tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Every backend is a process of its own, so a plain `static` is a
+    /// separate counter in each one. The shared one counts every session's queries.
+    #[test]
+    fn sessions_share_the_query_count() {
+        let _settings = default_settings();
+        let mut session_a = connect_as_app();
+        let mut session_b = connect_as_app();
+        let read = |client: &mut postgres::Client| -> i64 {
+            client
+                .query_one("SELECT tests.queries_checked()", &[])
+                .unwrap()
+                .get(0)
+        };
+        let before = read(&mut session_b);
+        for _ in 0..3 {
+            session_a.simple_query("SELECT 1").unwrap();
+        }
+        let after = read(&mut session_b);
+        // A's 3 queries and B's second read. Other tests run meanwhile, so
+        // the count can only be higher.
+        assert!(after - before >= 4, "B saw {} queries", after - before);
     }
 
     /// Calls `f` and returns how many queries the hook handled meanwhile.
