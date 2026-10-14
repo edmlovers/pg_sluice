@@ -1,20 +1,36 @@
 //! Postgres extension: executor hooks, shared memory, GUCs, SQL views and functions.
 
+use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
+use sluice_core::Rules;
 
 pgrx::pg_module_magic!(name, version);
 
 /// `sluice.enabled`: off makes the extension let every query through.
 static ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
 
-/// `sluice.rules`: the rule set as JSON. Not read yet.
+/// `sluice.rules`: the rule set as JSON. Read through [`refresh_rules`].
 static RULES: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"{\"budgets\":[]}"));
+
+/// This backend's parsed copy of `sluice.rules`.
+#[derive(Default)]
+struct LoadedRules {
+    /// The `sluice.rules` text last looked at, valid or not.
+    text: String,
+    /// Parsed from the last valid text. No budgets until there is one.
+    rules: Rules,
+}
+
+thread_local! {
+    // Every backend is a process of its own, so each one keeps its own copy.
+    static LOADED_RULES: RefCell<LoadedRules> = RefCell::new(LoadedRules::default());
+}
 
 /// How many client queries the ExecutorStart hook has handled in this backend
 /// (nested queries are skipped). Only read by tests.
@@ -78,6 +94,7 @@ unsafe extern "C-unwind" fn executor_start(query_desc: *mut pg_sys::QueryDesc, e
     let source_text = unsafe { (*query_desc).sourceText };
     if should_check(eflags) && !source_text.is_null() {
         HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
+        refresh_rules();
         let sql = unsafe { CStr::from_ptr(source_text) }.to_string_lossy();
         let tags = sluice_core::parse_tags(&sql);
         // A hard-coded rule until budgets arrive.
@@ -106,6 +123,34 @@ unsafe extern "C-unwind" fn executor_start(query_desc: *mut pg_sys::QueryDesc, e
             None => pg_sys::standard_ExecutorStart(query_desc, eflags),
         }
     }
+}
+
+/// Parses `sluice.rules` again if it changed since the last query.
+///
+/// pg_reload_conf() changes the setting in every backend, but only between two
+/// queries: so checking at the start of each query is enough. Invalid rules are
+/// reported once and otherwise ignored: the backend keeps its previous rules.
+fn refresh_rules() {
+    let text = match RULES.get() {
+        Some(text) => text.to_string_lossy().into_owned(),
+        None => String::new(),
+    };
+    LOADED_RULES.with_borrow_mut(|loaded| {
+        if loaded.text == text {
+            return;
+        }
+        match sluice_core::validate(&text, sluice_core::rules::DEFAULT_MAX_BUDGETS) {
+            Ok(rules) => loaded.rules = rules,
+            Err(errors) => {
+                let errors: Vec<String> = errors.iter().map(ToString::to_string).collect();
+                warning!(
+                    "sluice: sluice.rules is invalid, keeping the previous rules: {}",
+                    errors.join("; ")
+                );
+            }
+        }
+        loaded.text = text;
+    });
 }
 
 /// Whether sluice should look at the query that is starting.
@@ -179,7 +224,7 @@ mod tests {
 
     use pgrx::prelude::*;
 
-    use crate::HOOK_CALLS;
+    use crate::{HOOK_CALLS, LOADED_RULES};
 
     /// Does nothing: `client_tests` run it to get the test server started.
     #[pg_test]
@@ -189,6 +234,19 @@ mod tests {
     #[pg_extern]
     fn hook_calls() -> i64 {
         HOOK_CALLS.load(Ordering::Relaxed) as i64
+    }
+
+    /// Lets `client_tests` see the budgets this backend has loaded.
+    #[pg_extern]
+    fn loaded_budgets() -> Vec<String> {
+        LOADED_RULES.with_borrow(|loaded| {
+            loaded
+                .rules
+                .budgets
+                .iter()
+                .map(|b| b.name.clone())
+                .collect()
+        })
     }
 
     /// pg_stat_statements is loaded first, so its ExecutorStart hook is the one
@@ -346,9 +404,49 @@ mod client_tests {
         assert_rejected(&mut client, "SELECT 1 /* app='blocked' */");
     }
 
+    const REPORTS_RULES: &str =
+        r#"{"budgets":[{"name":"reports","mode":"warn","match":[{"app":"dashboard"}]}]}"#;
+
+    /// The budgets the backend behind `client` has loaded. The query goes
+    /// through the hook first, which loads the rules again if they changed.
+    fn loaded_budgets(client: &mut postgres::Client) -> Vec<String> {
+        client
+            .query_one("SELECT tests.loaded_budgets()", &[])
+            .unwrap()
+            .get(0)
+    }
+
+    /// Rules written from one session reach a session that is already open,
+    /// after pg_reload_conf().
+    #[test]
+    fn new_rules_reach_open_sessions() {
+        let _settings = SERVER_SETTINGS.write().unwrap_or_else(|e| e.into_inner());
+        let mut session_b = connect_as_app();
+        assert_eq!(loaded_budgets(&mut session_b), Vec::<String>::new());
+
+        // SystemSetting writes the rules from a session of its own (session A).
+        let _rules = SystemSetting::set("sluice.rules", REPORTS_RULES);
+        wait_for_setting(&mut session_b, "sluice.rules", REPORTS_RULES);
+        assert_eq!(loaded_budgets(&mut session_b), ["reports"]);
+    }
+
+    /// A typo in the rules must not leave the server without any: each
+    /// backend keeps the last rules that were valid (and logs a WARNING).
+    #[test]
+    fn invalid_rules_keep_the_previous_ones() {
+        let _settings = SERVER_SETTINGS.write().unwrap_or_else(|e| e.into_inner());
+        let mut client = connect_as_app();
+        let _rules = SystemSetting::set("sluice.rules", REPORTS_RULES);
+        wait_for_setting(&mut client, "sluice.rules", REPORTS_RULES);
+        assert_eq!(loaded_budgets(&mut client), ["reports"]);
+
+        let _invalid = SystemSetting::set("sluice.rules", "{not json");
+        wait_for_setting(&mut client, "sluice.rules", "{not json");
+        assert_eq!(loaded_budgets(&mut client), ["reports"]);
+    }
+
     /// A server-wide setting changed with ALTER SYSTEM. Dropping it resets the
-    /// setting, also when the test fails: other tests share the server, and
-    /// ALTER SYSTEM saves the value in the data directory, which outlives the run.
+    /// setting, also when the test fails, since the other tests share the server.
     struct SystemSetting {
         name: &'static str,
     }

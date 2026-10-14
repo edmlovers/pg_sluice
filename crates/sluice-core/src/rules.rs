@@ -19,7 +19,8 @@ pub const MAX_MATCH_KEYS: usize = 8;
 pub const MAX_NAME_LEN: usize = 32;
 pub const MAX_JSON_LEN: usize = 64 * 1024;
 
-#[derive(Debug, Clone, PartialEq)]
+/// The default has no budgets.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Rules {
     pub budgets: Vec<Budget>,
 }
