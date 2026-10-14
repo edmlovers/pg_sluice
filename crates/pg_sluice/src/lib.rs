@@ -1,12 +1,20 @@
 //! Postgres extension: executor hooks, shared memory, GUCs, SQL views and functions.
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use pgrx::pg_sys;
 use pgrx::prelude::*;
+use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
 
 pgrx::pg_module_magic!(name, version);
+
+/// `sluice.enabled`: off makes the extension let every query through.
+static ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+/// `sluice.rules`: the rule set as JSON. Not read yet.
+static RULES: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c"{\"budgets\":[]}"));
 
 /// How many client queries the ExecutorStart hook has handled in this backend
 /// (nested queries are skipped). Only read by tests.
@@ -31,6 +39,29 @@ static mut PREV_EXECUTOR_FINISH: pg_sys::ExecutorFinish_hook_type = None;
 /// and calls it, so they form a chain.
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    // SIGHUP settings live in postgresql.conf (or ALTER SYSTEM) and apply to
+    // the whole server. pg_reload_conf() makes every backend read them again,
+    // between two queries, so they change without a restart.
+    GucRegistry::define_bool_guc(
+        c"sluice.enabled",
+        c"Whether sluice checks queries at all.",
+        c"Off lets every query through.",
+        &ENABLED,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"sluice.rules",
+        c"The sluice rule set, as JSON.",
+        c"The budgets and what they match.",
+        &RULES,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    // Any other sluice.* name is now a typo, and setting it is an error
+    // instead of being silently ignored.
+    unsafe { pg_sys::MarkGUCPrefixReserved(c"sluice".as_ptr()) };
+
     unsafe {
         PREV_EXECUTOR_START = pg_sys::ExecutorStart_hook;
         pg_sys::ExecutorStart_hook = Some(executor_start);
@@ -79,6 +110,9 @@ unsafe extern "C-unwind" fn executor_start(query_desc: *mut pg_sys::QueryDesc, e
 
 /// Whether sluice should look at the query that is starting.
 fn should_check(eflags: i32) -> bool {
+    if !ENABLED.get() {
+        return false;
+    }
     // Queries run by a function or trigger belong to the query that started them.
     if NESTING_LEVEL.load(Ordering::Relaxed) > 0 {
         return false;
@@ -182,9 +216,23 @@ mod tests {
 /// app's, and errors come back with their SQLSTATE.
 #[cfg(test)]
 mod client_tests {
-    use std::sync::Once;
+    use std::sync::{Once, RwLock, RwLockReadGuard};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use postgres::error::SqlState;
+
+    /// The tests share one server and run in parallel. A test that changes a
+    /// server-wide setting holds this for writing; every other test holds it
+    /// for reading, so it never runs while a setting is changed.
+    static SERVER_SETTINGS: RwLock<()> = RwLock::new(());
+
+    /// Held for the whole test by tests that leave server settings alone.
+    fn default_settings() -> RwLockReadGuard<'static, ()> {
+        // A test that failed while holding the lock for writing poisons it.
+        // Its `SystemSetting` has put the setting back already.
+        SERVER_SETTINGS.read().unwrap_or_else(|e| e.into_inner())
+    }
 
     /// Starts the test server if it isn't running yet, and connects to it as
     /// the user that created it, a superuser.
@@ -241,6 +289,7 @@ mod client_tests {
 
     #[test]
     fn blocked_app_is_rejected() {
+        let _settings = default_settings();
         let mut client = connect_as_app();
         let err = client
             .simple_query("SELECT 1 /* app='blocked' */")
@@ -253,6 +302,7 @@ mod client_tests {
 
     #[test]
     fn other_apps_run() {
+        let _settings = default_settings();
         let mut client = connect_as_app();
         client
             .simple_query("SELECT 1 /* app='dashboard' */")
@@ -263,6 +313,7 @@ mod client_tests {
     /// Superusers must always get in, e.g. to fix a bad rule.
     #[test]
     fn superuser_is_not_checked() {
+        let _settings = default_settings();
         let mut client = connect();
         client.simple_query("SELECT 1 /* app='blocked' */").unwrap();
     }
@@ -270,11 +321,95 @@ mod client_tests {
     /// Plain EXPLAIN only plans the query. EXPLAIN ANALYZE runs it.
     #[test]
     fn explain_is_not_checked_but_explain_analyze_is() {
+        let _settings = default_settings();
         let mut client = connect_as_app();
         client
             .simple_query("EXPLAIN SELECT 1 /* app='blocked' */")
             .unwrap();
         assert_rejected(&mut client, "EXPLAIN ANALYZE SELECT 1 /* app='blocked' */");
+    }
+
+    /// Turning sluice off takes ALTER SYSTEM and a reload, no restart: even a
+    /// session that is already open stops being checked.
+    #[test]
+    fn disabling_lets_queries_through() {
+        let _settings = SERVER_SETTINGS.write().unwrap_or_else(|e| e.into_inner());
+        let mut client = connect_as_app();
+        assert_rejected(&mut client, "SELECT 1 /* app='blocked' */");
+
+        let disabled = SystemSetting::set("sluice.enabled", "off");
+        wait_for_setting(&mut client, "sluice.enabled", "off");
+        client.simple_query("SELECT 1 /* app='blocked' */").unwrap();
+
+        drop(disabled);
+        wait_for_setting(&mut client, "sluice.enabled", "on");
+        assert_rejected(&mut client, "SELECT 1 /* app='blocked' */");
+    }
+
+    /// A server-wide setting changed with ALTER SYSTEM. Dropping it resets the
+    /// setting, also when the test fails: other tests share the server, and
+    /// ALTER SYSTEM saves the value in the data directory, which outlives the run.
+    struct SystemSetting {
+        name: &'static str,
+    }
+
+    impl SystemSetting {
+        fn set(name: &'static str, value: &str) -> Self {
+            let quoted = value.replace('\'', "''");
+            alter_system(
+                &format!("ALTER SYSTEM SET {name} = '{quoted}'"),
+                name,
+                value,
+            );
+            Self { name }
+        }
+    }
+
+    impl Drop for SystemSetting {
+        fn drop(&mut self) {
+            let default: String = connect()
+                .query_one(
+                    "SELECT boot_val FROM pg_settings WHERE name = $1",
+                    &[&self.name],
+                )
+                .unwrap()
+                .get(0);
+            let sql = format!("ALTER SYSTEM RESET {}", self.name);
+            alter_system(&sql, self.name, &default);
+        }
+    }
+
+    /// Runs an ALTER SYSTEM command that sets `name` to `value`, and reloads the
+    /// config. Returns once new connections get the value; open ones may lag.
+    fn alter_system(sql: &str, name: &str, value: &str) {
+        let mut admin = connect();
+        // ALTER SYSTEM can't run in a transaction, so not in one batch with the reload.
+        admin.batch_execute(sql).unwrap();
+        admin.batch_execute("SELECT pg_reload_conf()").unwrap();
+        // The postmaster reloads first, then signals its backends. So once
+        // `admin` has the value, every backend forked from now on has it too.
+        wait_for_setting(&mut admin, name, value);
+    }
+
+    /// Waits until the backend behind `client` uses `value` for `name`.
+    /// pg_reload_conf() only sends a signal: each backend reloads its config
+    /// on its own, before its next query.
+    fn wait_for_setting(client: &mut postgres::Client, name: &str, value: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let current: String = client
+                .query_one("SELECT current_setting($1)", &[&name])
+                .unwrap()
+                .get(0);
+            if current == value {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{name} is {current}, not {value}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Calls `f` and returns how many queries the hook handled meanwhile.
@@ -296,6 +431,7 @@ mod client_tests {
 
     #[test]
     fn hook_runs_for_each_query() {
+        let _settings = default_settings();
         let mut client = connect_as_app();
         let calls = hook_calls_during(&mut client, |c| {
             c.simple_query("SELECT 1").unwrap();
@@ -307,6 +443,7 @@ mod client_tests {
     /// A function's queries belong to the query that called it: count it once.
     #[test]
     fn nested_queries_are_handled_once() {
+        let _settings = default_settings();
         let mut client = connect_as_app();
         let calls = hook_calls_during(&mut client, |c| {
             c.simple_query("SELECT sluice_three_queries()").unwrap();
@@ -318,6 +455,7 @@ mod client_tests {
     /// or every later query in the session would look nested and be skipped.
     #[test]
     fn failed_nested_query_does_not_leave_session_nested() {
+        let _settings = default_settings();
         let mut client = connect_as_app();
         let err = client.simple_query("SELECT sluice_fails()").unwrap_err();
         assert_eq!(*err.code().unwrap(), SqlState::DIVISION_BY_ZERO);
