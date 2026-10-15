@@ -9,6 +9,10 @@ use pgrx::prelude::*;
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting, PgAtomic, pg_shmem_init};
 use sluice_core::{RuleIndex, Rules};
 
+mod budgets;
+
+use budgets::BUDGETS;
+
 pgrx::pg_module_magic!(name, version);
 
 /// `sluice.enabled`: off makes the extension let every query through.
@@ -27,6 +31,9 @@ struct LoadedRules {
     rules: Rules,
     /// Which budgets a query's tags fall under, built from `rules`.
     index: RuleIndex,
+    /// Each budget's slot in the shared budget table, in the order of
+    /// `rules.budgets`. None if the table had no room for it.
+    slots: Vec<Option<usize>>,
 }
 
 thread_local! {
@@ -90,6 +97,7 @@ pub extern "C-unwind" fn _PG_init() {
     // Asks the postmaster for room in shared memory. That is only possible
     // while it starts, so another reason to be in shared_preload_libraries.
     pg_shmem_init!(QUERIES_CHECKED);
+    pg_shmem_init!(BUDGETS);
 
     unsafe {
         PREV_EXECUTOR_START = pg_sys::ExecutorStart_hook;
@@ -156,6 +164,17 @@ fn refresh_rules() {
         match sluice_core::validate(&text, sluice_core::rules::DEFAULT_MAX_BUDGETS) {
             Ok(rules) => {
                 loaded.index = RuleIndex::new(&rules);
+                loaded.slots = rules
+                    .budgets
+                    .iter()
+                    .map(|budget| {
+                        let slot = BUDGETS.get().slot_for(&budget.name);
+                        if slot.is_none() {
+                            warning!("sluice: no room for budget {}, it is ignored", budget.name);
+                        }
+                        slot
+                    })
+                    .collect();
                 loaded.rules = rules;
             }
             Err(errors) => {
@@ -309,6 +328,19 @@ mod tests {
     #[pg_extern]
     fn queries_checked() -> i64 {
         QUERIES_CHECKED.get().load(Ordering::Relaxed) as i64
+    }
+
+    /// Lets `client_tests` see where this backend's budgets live in the shared
+    /// budget table: one slot per budget, -1 for none.
+    #[pg_extern]
+    fn budget_slots() -> Vec<i32> {
+        LOADED_RULES.with_borrow(|loaded| {
+            loaded
+                .slots
+                .iter()
+                .map(|slot| slot.map_or(-1, |s| s as i32))
+                .collect()
+        })
     }
 
     /// Lets `client_tests` see the budgets this backend has loaded.
@@ -634,6 +666,54 @@ mod client_tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// The slots the backend behind `client` uses for its budgets, in order.
+    fn budget_slots(client: &mut postgres::Client) -> Vec<i32> {
+        client
+            .query_one("SELECT tests.budget_slots()", &[])
+            .unwrap()
+            .get(0)
+    }
+
+    /// Every backend finds a budget's state in the same slot of the shared table.
+    #[test]
+    fn sessions_find_budgets_in_the_same_slots() {
+        let _settings = SERVER_SETTINGS.write().unwrap_or_else(|e| e.into_inner());
+        // One line: ALTER SYSTEM refuses values with a newline.
+        let rules = concat!(
+            r#"{"budgets":[{"name":"slot-a","mode":"warn","match":[{"app":"a"}]},"#,
+            r#"{"name":"slot-b","mode":"warn","match":[{"app":"b"}]}]}"#,
+        );
+        let _rules = SystemSetting::set("sluice.rules", rules);
+        let mut session_a = connect_as_app();
+        let mut session_b = connect_as_app();
+
+        let slots = budget_slots(&mut session_a);
+        assert_eq!(slots.len(), 2);
+        assert!(slots.iter().all(|&slot| slot >= 0), "{slots:?}");
+        assert_ne!(slots[0], slots[1]);
+        assert_eq!(budget_slots(&mut session_b), slots);
+    }
+
+    /// A budget keeps its slot, and so its state, when the rules change around it.
+    #[test]
+    fn budget_keeps_its_slot_when_rules_change() {
+        let _settings = SERVER_SETTINGS.write().unwrap_or_else(|e| e.into_inner());
+        let mut client = connect_as_app();
+        let before = r#"{"budgets":[{"name":"keep","mode":"warn","match":[{"app":"a"}]}]}"#;
+        let _rules = SystemSetting::set("sluice.rules", before);
+        wait_for_setting(&mut client, "sluice.rules", before);
+        let slot = budget_slots(&mut client)[0];
+
+        // A new budget declared first, and a different limit on "keep".
+        let after = concat!(
+            r#"{"budgets":[{"name":"new","mode":"warn","match":[{"app":"b"}]},"#,
+            r#"{"name":"keep","mode":"enforce","match":[{"app":"a"}],"max_concurrent":5}]}"#,
+        );
+        let _rules = SystemSetting::set("sluice.rules", after);
+        wait_for_setting(&mut client, "sluice.rules", after);
+        assert_eq!(budget_slots(&mut client)[1], slot);
     }
 
     /// Every backend is a process of its own, so a plain `static` is a
