@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting, PgAtomic, pg_shmem_init};
-use sluice_core::{RuleIndex, Rules};
+use sluice_core::{Mode, RuleIndex, Rules, Tags};
 
 mod budgets;
 
@@ -36,9 +36,19 @@ struct LoadedRules {
     slots: Vec<Option<usize>>,
 }
 
+/// The budget slots one of this backend's queries took, to give back when it ends.
+struct HeldSlots {
+    query: *const pg_sys::QueryDesc,
+    slots: Vec<usize>,
+}
+
 thread_local! {
     // Every backend is a process of its own, so each one keeps its own copy.
     static LOADED_RULES: RefCell<LoadedRules> = RefCell::new(LoadedRules::default());
+
+    // One entry per running query that took slots. A backend can have more
+    // than one, e.g. a query that runs while a cursor is open.
+    static HELD: RefCell<Vec<HeldSlots>> = const { RefCell::new(Vec::new()) };
 }
 
 /// How many client queries the ExecutorStart hook has handled in this backend
@@ -62,6 +72,7 @@ static NESTING_LEVEL: AtomicU32 = AtomicU32::new(0);
 static mut PREV_EXECUTOR_START: pg_sys::ExecutorStart_hook_type = None;
 static mut PREV_EXECUTOR_RUN: pg_sys::ExecutorRun_hook_type = None;
 static mut PREV_EXECUTOR_FINISH: pg_sys::ExecutorFinish_hook_type = None;
+static mut PREV_EXECUTOR_END: pg_sys::ExecutorEnd_hook_type = None;
 
 /// Runs once when Postgres loads the library. Hooks are global function pointers,
 /// so the library has to be in `shared_preload_libraries`: every backend then
@@ -106,6 +117,8 @@ pub extern "C-unwind" fn _PG_init() {
         pg_sys::ExecutorRun_hook = Some(executor_run);
         PREV_EXECUTOR_FINISH = pg_sys::ExecutorFinish_hook;
         pg_sys::ExecutorFinish_hook = Some(executor_finish);
+        PREV_EXECUTOR_END = pg_sys::ExecutorEnd_hook;
+        pg_sys::ExecutorEnd_hook = Some(executor_end);
     }
 }
 
@@ -130,6 +143,15 @@ unsafe extern "C-unwind" fn executor_start(query_desc: *mut pg_sys::QueryDesc, e
                 "reason=blocked app=blocked",
             );
         }
+        let slots = admit(&tags);
+        if !slots.is_empty() {
+            HELD.with_borrow_mut(|held| {
+                held.push(HeldSlots {
+                    query: query_desc,
+                    slots,
+                })
+            });
+        }
     }
 
     // Pass the query on down the chain. Only the last hook calls the standard
@@ -145,6 +167,57 @@ unsafe extern "C-unwind" fn executor_start(query_desc: *mut pg_sys::QueryDesc, e
             None => pg_sys::standard_ExecutorStart(query_desc, eflags),
         }
     }
+}
+
+/// Counts the query as running in every budget it matches that has a
+/// `max_concurrent`, and returns the slots it took. If an enforced budget is
+/// full, gives them back and raises an ERROR instead: the query never starts.
+fn admit(tags: &Tags) -> Vec<usize> {
+    let mut taken = Vec::new();
+    // Budgets come in declaration order: the first full one rejects the query.
+    let rejection = LOADED_RULES.with_borrow(|loaded| {
+        for i in loaded.index.matching_budgets(tags) {
+            let i = usize::from(i);
+            let budget = &loaded.rules.budgets[i];
+            let (Some(limit), Some(slot)) = (budget.max_concurrent, loaded.slots[i]) else {
+                continue;
+            };
+            if budget.mode == Mode::Off {
+                continue;
+            }
+            let state = BUDGETS.get().budget(slot);
+            match state.try_start(limit) {
+                Ok(()) => taken.push(slot),
+                Err(running) => {
+                    let detail = format!(
+                        "budget={} reason=concurrency running={running} limit={limit}",
+                        budget.name
+                    );
+                    if budget.mode == Mode::Enforce {
+                        return Some(detail);
+                    }
+                    // Warn mode: let the query run, count it, and tell the
+                    // server log what enforce would have done.
+                    log!("sluice: would reject query: {detail}");
+                    state.start();
+                    taken.push(slot);
+                }
+            }
+        }
+        None
+    });
+    if let Some(detail) = rejection {
+        for slot in taken {
+            BUDGETS.get().budget(slot).finish();
+        }
+        ereport!(
+            ERROR,
+            PgSqlErrorCode::ERRCODE_INSUFFICIENT_RESOURCES,
+            "sluice: query rejected",
+            &detail,
+        );
+    }
+    taken
 }
 
 /// Parses `sluice.rules` again if it changed since the last query.
@@ -305,6 +378,30 @@ unsafe extern "C-unwind" fn executor_finish(query_desc: *mut pg_sys::QueryDesc) 
     .execute();
 }
 
+/// Called once a query is done. Gives back the budget slots it took.
+///
+/// TODO(T4.4): Postgres skips ExecutorEnd when a query fails or is cancelled,
+/// so its slots are never given back.
+#[pg_guard]
+unsafe extern "C-unwind" fn executor_end(query_desc: *mut pg_sys::QueryDesc) {
+    // Nested queries took no slots, so they have no entry.
+    let held = HELD.with_borrow_mut(|held| {
+        let i = held.iter().position(|h| h.query == query_desc)?;
+        Some(held.swap_remove(i))
+    });
+    if let Some(held) = held {
+        for slot in held.slots {
+            BUDGETS.get().budget(slot).finish();
+        }
+    }
+    unsafe {
+        match PREV_EXECUTOR_END {
+            Some(prev) => pg_sys::ffi::pg_guard_ffi_boundary(|| prev(query_desc)),
+            None => pg_sys::standard_ExecutorEnd(query_desc),
+        }
+    }
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
@@ -312,7 +409,8 @@ mod tests {
 
     use pgrx::prelude::*;
 
-    use crate::{HOOK_CALLS, LOADED_RULES, QUERIES_CHECKED};
+    use crate::budgets::BUDGETS;
+    use crate::{HOOK_CALLS, LOADED_RULES, QUERIES_CHECKED, refresh_rules};
 
     /// Does nothing: `client_tests` run it to get the test server started.
     #[pg_test]
@@ -340,6 +438,22 @@ mod tests {
                 .iter()
                 .map(|slot| slot.map_or(-1, |s| s as i32))
                 .collect()
+        })
+    }
+
+    /// How many queries of the budget called `name` are running, in all backends.
+    #[pg_extern]
+    fn budget_running(name: &str) -> i64 {
+        refresh_rules();
+        LOADED_RULES.with_borrow(|loaded| {
+            let i = loaded
+                .rules
+                .budgets
+                .iter()
+                .position(|b| b.name == name)
+                .expect("no such budget");
+            let slot = loaded.slots[i].expect("budget has no slot");
+            i64::from(BUDGETS.get().budget(slot).running())
         })
     }
 
@@ -714,6 +828,83 @@ mod client_tests {
         let _rules = SystemSetting::set("sluice.rules", after);
         wait_for_setting(&mut client, "sluice.rules", after);
         assert_eq!(budget_slots(&mut client)[1], slot);
+    }
+
+    /// How many queries of the budget called `name` are running.
+    fn budget_running(name: &str) -> i64 {
+        connect()
+            .query_one("SELECT tests.budget_running($1)", &[&name])
+            .unwrap()
+            .get(0)
+    }
+
+    /// With `max_concurrent: 2`, a third query of the budget is turned away
+    /// while two run, and gets in again once they are done.
+    #[test]
+    fn max_concurrent_rejects_the_extra_query() {
+        let _settings = SERVER_SETTINGS.write().unwrap_or_else(|e| e.into_inner());
+        let rules = concat!(
+            r#"{"budgets":[{"name":"two-at-a-time","mode":"enforce","#,
+            r#""match":[{"app":"x"}],"max_concurrent":2}]}"#,
+        );
+        let _rules = SystemSetting::set("sluice.rules", rules);
+
+        // Two queries wait on an advisory lock held here, so they keep running
+        // until it is released.
+        let mut admin = connect();
+        admin.simple_query("SELECT pg_advisory_lock(42)").unwrap();
+        let waiting: Vec<_> = (0..2)
+            .map(|_| {
+                thread::spawn(|| {
+                    connect_as_app()
+                        .simple_query("SELECT pg_advisory_xact_lock_shared(42) /* app='x' */")
+                })
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while budget_running("two-at-a-time") < 2 {
+            assert!(Instant::now() < deadline, "the two queries never started");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut third = connect_as_app();
+        let err = third.simple_query("SELECT 1 /* app='x' */").unwrap_err();
+        let err = err.as_db_error().unwrap();
+        assert_eq!(*err.code(), SqlState::INSUFFICIENT_RESOURCES);
+        assert_eq!(
+            err.detail(),
+            Some("budget=two-at-a-time reason=concurrency running=2 limit=2")
+        );
+
+        admin.simple_query("SELECT pg_advisory_unlock(42)").unwrap();
+        for query in waiting {
+            query.join().unwrap().unwrap();
+        }
+        assert_eq!(budget_running("two-at-a-time"), 0);
+        third.simple_query("SELECT 1 /* app='x' */").unwrap();
+    }
+
+    /// `enforce` rejects, `warn` only logs, `off` ignores the budget. A
+    /// rejected query gives back the slots it already took in other budgets.
+    #[test]
+    fn only_enforce_mode_rejects() {
+        let _settings = SERVER_SETTINGS.write().unwrap_or_else(|e| e.into_inner());
+        let rules = concat!(
+            r#"{"budgets":["#,
+            r#"{"name":"m-roomy","mode":"enforce","match":[{"team":"t"}],"max_concurrent":5},"#,
+            r#"{"name":"m-enforce","mode":"enforce","match":[{"app":"e"}],"max_concurrent":0},"#,
+            r#"{"name":"m-warn","mode":"warn","match":[{"app":"w"}],"max_concurrent":0},"#,
+            r#"{"name":"m-off","mode":"off","match":[{"app":"o"}],"max_concurrent":0}]}"#,
+        );
+        let _rules = SystemSetting::set("sluice.rules", rules);
+        let mut client = connect_as_app();
+        // Takes a slot in m-roomy, declared first, then m-enforce turns it away.
+        assert_rejected(&mut client, "SELECT 1 /* app='e',team='t' */");
+        client.simple_query("SELECT 1 /* app='w' */").unwrap();
+        client.simple_query("SELECT 1 /* app='o' */").unwrap();
+        for name in ["m-roomy", "m-enforce", "m-warn", "m-off"] {
+            assert_eq!(budget_running(name), 0, "{name}");
+        }
     }
 
     /// Every backend is a process of its own, so a plain `static` is a
