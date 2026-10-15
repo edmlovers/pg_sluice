@@ -9,7 +9,7 @@
 //! its slot by hashing its name.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use pgrx::{PGRXSharedMemory, PgAtomic};
 
@@ -27,9 +27,40 @@ pub struct BudgetTable {
 /// One budget's state, shared by all backends.
 #[repr(C)]
 #[derive(Default)]
-struct BudgetState {
+pub struct BudgetState {
     /// Hash of the budget's name, or 0 while the slot is free.
     name_hash: AtomicU64,
+    /// How many of the budget's queries are running right now.
+    running: AtomicU32,
+}
+
+impl BudgetState {
+    #[cfg(any(test, feature = "pg_test"))]
+    pub fn running(&self) -> u32 {
+        self.running.load(Ordering::Acquire)
+    }
+
+    /// Counts one more running query if fewer than `limit` are running.
+    /// Otherwise returns how many are.
+    pub fn try_start(&self, limit: u32) -> Result<(), u32> {
+        // fetch_update retries a compare_exchange until no other backend changed
+        // `running` in between. A plain fetch_add and a check afterwards would
+        // go over the limit for a moment, and could turn away someone else.
+        self.running
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |running| {
+                (running < limit).then_some(running + 1)
+            })
+            .map(|_| ())
+    }
+
+    /// Counts one more running query, whatever the limit.
+    pub fn start(&self) {
+        self.running.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn finish(&self) {
+        self.running.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 // Safe because every field is an atomic: backends can use them at the same time.
@@ -44,6 +75,10 @@ impl Default for BudgetTable {
 }
 
 impl BudgetTable {
+    pub fn budget(&self, slot: usize) -> &BudgetState {
+        &self.budgets[slot]
+    }
+
     /// The slot that holds the state of the budget called `name`. The first
     /// backend to ask claims a free slot; every later one finds the same slot.
     /// None if the table is full.
@@ -88,6 +123,17 @@ fn name_hash(name: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn try_start_stops_at_the_limit() {
+        let budget = BudgetState::default();
+        assert_eq!(budget.try_start(2), Ok(()));
+        assert_eq!(budget.try_start(2), Ok(()));
+        assert_eq!(budget.try_start(2), Err(2));
+        budget.finish();
+        assert_eq!(budget.try_start(2), Ok(()));
+        assert_eq!(budget.running(), 2);
+    }
 
     #[test]
     fn same_name_same_slot() {
